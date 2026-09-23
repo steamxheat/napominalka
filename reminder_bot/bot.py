@@ -5,6 +5,7 @@ import os
 import secrets
 import shutil
 import sqlite3
+import struct
 import subprocess
 import traceback
 import tempfile
@@ -27,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "reminders.sqlite3"
 MODEL_DIR = ROOT / "models" / "vosk-model-small-ru-0.22"
 MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
 WHISPER_MODEL_DIR = ROOT / "models" / "faster-whisper"
 WHISPER_MODEL = None
 PENDING: dict[int, dict[str, Any]] = {}
@@ -347,6 +348,7 @@ def handle_message(message: dict[str, Any]) -> None:
     ensure_user(user_id)
 
     if "voice" in message:
+        print(f"Voice message received: {message['voice']}")
         try:
             text = transcribe_voice(message["voice"]["file_id"])
         except Exception:
@@ -643,15 +645,18 @@ def transcribe_voice(file_id: str) -> str | None:
     file_info = api("getFile", {"file_id": file_id})
     file_url = f"{FILE_API}/{file_info['file_path']}"
     suffix = Path(file_info["file_path"]).suffix or ".ogg"
+    print(f"Downloading voice file: path={file_info['file_path']} size={file_info.get('file_size')}")
     with tempfile.TemporaryDirectory() as temp_dir:
         source = Path(temp_dir) / f"voice{suffix}"
         wav = Path(temp_dir) / "voice.wav"
         with urllib.request.urlopen(file_url, timeout=60) as response:
             source.write_bytes(response.read())
+        print(f"Voice downloaded: {source.stat().st_size} bytes")
         wav = convert_to_wav(source, wav)
-        text = whisper_transcribe(wav) or vosk_transcribe(wav)
-        print(f"Voice transcription: {text!r}")
-        return text
+        whisper_text = whisper_transcribe(wav)
+        vosk_text = None if whisper_text else vosk_transcribe(wav)
+        print(f"Voice transcription: whisper={whisper_text!r} vosk={vosk_text!r}")
+        return whisper_text or vosk_text
 
 
 def convert_to_wav(source: Path, wav: Path) -> Path:
@@ -675,6 +680,7 @@ def convert_to_wav(source: Path, wav: Path) -> Path:
         ],
         check=True,
     )
+    print(f"Voice converted to wav: {wav.stat().st_size} bytes")
     return wav
 
 
@@ -689,15 +695,48 @@ def whisper_transcribe(wav: Path) -> str | None:
         WHISPER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
         WHISPER_MODEL = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8", download_root=str(WHISPER_MODEL_DIR))
 
+    if wav_rms(wav) < 50:
+        print("Voice skipped: audio is too quiet")
+        return None
+
     segments, _info = WHISPER_MODEL.transcribe(
         str(wav),
         language="ru",
         beam_size=5,
+        best_of=5,
         condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        log_prob_threshold=-2.0,
         vad_filter=False,
     )
-    text = " ".join(segment.text.strip() for segment in segments).strip()
+    pieces = []
+    for segment in segments:
+        print(
+            "Whisper segment:",
+            {
+                "text": segment.text,
+                "avg_logprob": segment.avg_logprob,
+                "no_speech_prob": segment.no_speech_prob,
+            },
+        )
+        if segment.no_speech_prob > 0.75:
+            continue
+        pieces.append(segment.text.strip())
+    text = " ".join(pieces).strip()
     return text or None
+
+
+def wav_rms(wav: Path) -> float:
+    with wave.open(str(wav), "rb") as audio:
+        if audio.getsampwidth() != 2:
+            return 100.0
+        frames = audio.readframes(audio.getnframes())
+    if not frames:
+        return 0.0
+    samples = struct.unpack("<" + "h" * (len(frames) // 2), frames)
+    if not samples:
+        return 0.0
+    return (sum(sample * sample for sample in samples) / len(samples)) ** 0.5
 
 
 def ensure_vosk_model() -> Path:
