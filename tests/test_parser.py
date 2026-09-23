@@ -73,6 +73,29 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(parsed.lead_minutes, 420)
         self.assertEqual(parsed.title, "сдать дз")
 
+    def test_dash_time_and_filler_words(self):
+        now = datetime(2026, 9, 23, 19, 26, tzinfo=ZoneInfo("Europe/Moscow"))
+        parsed = parse_reminder("напомни мне сегодня в 19-30 что нужно поккакать", now, "Europe/Moscow")
+        self.assertEqual(parsed.title, "поккакать")
+        self.assertEqual(parsed.due_at.strftime("%Y-%m-%d %H:%M"), "2026-09-23 19:30")
+
+    def test_spaced_time_and_filler_words(self):
+        now = datetime(2026, 9, 23, 16, 26, tzinfo=ZoneInfo("Europe/Moscow"))
+        parsed = parse_reminder("напомни мне в 17 00 сегодня я должен посрать", now, "Europe/Moscow")
+        self.assertEqual(parsed.title, "посрать")
+        self.assertEqual(parsed.due_at.strftime("%Y-%m-%d %H:%M"), "2026-09-23 17:00")
+
+    def test_explicit_today_past_time_is_rejected(self):
+        now = datetime(2026, 9, 23, 19, 26, tzinfo=ZoneInfo("Europe/Moscow"))
+        with self.assertRaises(ValueError):
+            parse_reminder("напомни мне сегодня в 17:00 посрать", now, "Europe/Moscow")
+
+    def test_whisper_common_transcription_variant(self):
+        now = datetime(2026, 9, 23, 19, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+        parsed = parse_reminder("Напомним мне сегодня в 19-30 купить хлеб.", now, "Europe/Moscow")
+        self.assertEqual(parsed.title, "купить хлеб")
+        self.assertEqual(parsed.due_at.strftime("%Y-%m-%d %H:%M"), "2026-09-23 19:30")
+
     def test_apply_time_advances_recurring_to_future(self):
         now = datetime(2026, 9, 23, 18, tzinfo=ZoneInfo("Europe/Moscow"))
         parsed = parse_reminder("каждый день купить хлеб", now, "Europe/Moscow")

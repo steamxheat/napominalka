@@ -11,7 +11,7 @@ import tempfile
 import time as time_module
 import urllib.parse
 import urllib.request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 import wave
 import zipfile
 from contextlib import contextmanager
@@ -27,6 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "reminders.sqlite3"
 MODEL_DIR = ROOT / "models" / "vosk-model-small-ru-0.22"
 MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
+WHISPER_MODEL_DIR = ROOT / "models" / "faster-whisper"
+WHISPER_MODEL = None
 PENDING: dict[int, dict[str, Any]] = {}
 
 
@@ -49,6 +52,7 @@ if not TOKEN:
 API = f"https://api.telegram.org/bot{TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{TOKEN}"
 DEFAULT_TZ = os.environ.get("DEFAULT_TIMEZONE", "Europe/Moscow")
+POLL_TIMEOUT = int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "0"))
 
 
 @contextmanager
@@ -644,17 +648,56 @@ def transcribe_voice(file_id: str) -> str | None:
         wav = Path(temp_dir) / "voice.wav"
         with urllib.request.urlopen(file_url, timeout=60) as response:
             source.write_bytes(response.read())
-        return vosk_transcribe(convert_to_wav(source, wav))
+        wav = convert_to_wav(source, wav)
+        text = whisper_transcribe(wav) or vosk_transcribe(wav)
+        print(f"Voice transcription: {text!r}")
+        return text
 
 
 def convert_to_wav(source: Path, wav: Path) -> Path:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg не найден")
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(source), "-ac", "1", "-ar", "16000", str(wav)],
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source),
+            "-af",
+            "loudnorm,highpass=f=80,lowpass=f=7800",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(wav),
+        ],
         check=True,
     )
     return wav
+
+
+def whisper_transcribe(wav: Path) -> str | None:
+    global WHISPER_MODEL
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        return None
+
+    if WHISPER_MODEL is None:
+        WHISPER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        WHISPER_MODEL = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8", download_root=str(WHISPER_MODEL_DIR))
+
+    segments, _info = WHISPER_MODEL.transcribe(
+        str(wav),
+        language="ru",
+        beam_size=5,
+        condition_on_previous_text=False,
+        vad_filter=False,
+    )
+    text = " ".join(segment.text.strip() for segment in segments).strip()
+    return text or None
 
 
 def ensure_vosk_model() -> Path:
@@ -680,16 +723,18 @@ def vosk_transcribe(wav: Path) -> str | None:
 
     SetLogLevel(-1)
     model = Model(str(ensure_vosk_model()))
+    chunks = []
     with wave.open(str(wav), "rb") as audio:
         recognizer = KaldiRecognizer(model, audio.getframerate())
         while True:
             data = audio.readframes(4000)
             if not data:
                 break
-            recognizer.AcceptWaveform(data)
-        result = json.loads(recognizer.FinalResult()).get("text", "").strip()
-        return result or None
-    return None
+            if recognizer.AcceptWaveform(data):
+                chunks.append(json.loads(recognizer.Result()).get("text", ""))
+        chunks.append(json.loads(recognizer.FinalResult()).get("text", ""))
+    result = " ".join(chunk.strip() for chunk in chunks if chunk.strip()).strip()
+    return result or None
 
 
 HELP = """Примеры:
@@ -714,13 +759,22 @@ def main() -> None:
         try:
             updates = api(
                 "getUpdates",
-                {"offset": offset, "timeout": 20, "allowed_updates": json.dumps(["message", "callback_query"])},
+                {"offset": offset, "timeout": POLL_TIMEOUT, "allowed_updates": json.dumps(["message", "callback_query"])},
             )
         except HTTPError as exc:
             if exc.code == 409:
                 print("Telegram getUpdates conflict; waiting for the previous poll to finish.")
                 time_module.sleep(5)
                 continue
+            if exc.code >= 500:
+                print(f"Telegram getUpdates server error {exc.code}; retrying.")
+                time_module.sleep(10)
+                continue
+            raise
+        except URLError as exc:
+            print(f"Telegram getUpdates network error: {exc}; retrying.")
+            time_module.sleep(10)
+            continue
             raise
         for update in updates:
             offset = max(offset, update["update_id"] + 1)
@@ -739,6 +793,8 @@ def main() -> None:
                         send_message(target["chat"]["id"], f"Ошибка: {exc}")
                     except Exception:
                         traceback.print_exc()
+        if not updates:
+            time_module.sleep(1)
 
 
 if __name__ == "__main__":

@@ -71,6 +71,8 @@ def parse_reminder(text: str, now: datetime, tz_name: str) -> ParsedReminder:
         if recurrence:
             while due_at <= now:
                 due_at = next_occurrence(due_at, recurrence, tz_name)
+        elif "сегодня" in lower:
+            raise ValueError("Это время сегодня уже прошло")
         else:
             due_at += timedelta(days=1)
 
@@ -250,7 +252,19 @@ def _parse_day(text: str, now: datetime, recurrence: str | None) -> date | None:
 
 
 def _parse_time(text: str) -> time | None:
-    match = re.search(r"\b(?:в\s*)?(\d{1,2})[:.](\d{2})\b", text)
+    match = re.search(r"\bв\s+(\d{1,2})\s*[:.\-]\s*(\d{2})\b", text)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        _validate_time(hour, minute)
+        return time(hour, minute)
+
+    match = re.search(r"\bв\s+(\d{1,2})\s+(\d{2})\b", text)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        _validate_time(hour, minute)
+        return time(hour, minute)
+
+    match = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
     if match:
         hour, minute = int(match.group(1)), int(match.group(2))
         _validate_time(hour, minute)
@@ -308,7 +322,15 @@ def _parse_lead_minutes(text: str) -> int | None:
 
 
 def _has_time(text: str) -> bool:
-    return bool(re.search(r"\b(?:в\s*)?\d{1,2}[:.]\d{2}\b|\bв\s+\d{1,2}(?:\s*(утра|вечера|дня|ночи))?\b", text))
+    return bool(
+        re.search(
+            r"\bв\s+\d{1,2}\s*[:.\-]\s*\d{2}\b|"
+            r"\bв\s+\d{1,2}\s+\d{2}\b|"
+            r"\b\d{1,2}:\d{2}\b|"
+            r"\bв\s+\d{1,2}(?:\s*(утра|вечера|дня|ночи))?\b",
+            text,
+        )
+    )
 
 
 def _has_relative_time(text: str) -> bool:
@@ -318,12 +340,14 @@ def _has_relative_time(text: str) -> bool:
 def _clean_title(text: str) -> str:
     cleaned = text
     patterns = [
-        r"\b(напомни(ть)?|мне надо|надо|нужно|хочу|пожалуйста)\b",
+        r"\b(напомн(?:и|ить|им|ю)?|мне надо|я должен|я должна|мне нужно|что нужно|мне|надо|нужно|должен|должна|хочу|пожалуйста)\b",
         r"\b(сегодня|завтра|послезавтра)\b",
         r"\bчерез\s+(\d+\s*)?(минут[уы]?|мин|час[аов]?|дн[яей]|полчаса)\b",
         r"\bза\s+\d+\s*(минут[уы]?|мин|час(?:а|ов)?)\b",
         r"\bза\s+час\b",
-        r"\b(?:в\s*)?\d{1,2}[:.]\d{2}\b",
+        r"\bв\s+\d{1,2}\s*[:.\-]\s*\d{2}\b",
+        r"\bв\s+\d{1,2}\s+\d{2}\b",
+        r"\b\d{1,2}:\d{2}\b",
         r"\bв\s+\d{1,2}(?:\s*(утра|вечера|дня|ночи))?\b",
         r"\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b",
         r"\b\d{1,2}\s+(" + "|".join(MONTHS) + r")\b",
