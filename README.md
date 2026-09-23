@@ -15,6 +15,8 @@
 
 ## Запуск
 
+Для установки на Mac Mini смотрите [INSTALL_MAC.md](INSTALL_MAC.md).
+
 ```bash
 cd work/telegram-reminder-bot
 python3 -m venv .venv
