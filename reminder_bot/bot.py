@@ -34,6 +34,15 @@ WHISPER_MODEL = None
 PENDING: dict[int, dict[str, Any]] = {}
 
 
+class TelegramAPIError(RuntimeError):
+    def __init__(self, method: str, code: int, description: str, payload: dict[str, Any] | None = None) -> None:
+        self.method = method
+        self.code = code
+        self.description = description
+        self.payload = payload or {}
+        super().__init__(f"Telegram {method} failed with HTTP {code}: {description}")
+
+
 def load_env() -> None:
     env = ROOT / ".env"
     if not env.exists():
@@ -105,29 +114,68 @@ def init_db() -> None:
 def api(method: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
     encoded = urllib.parse.urlencode(data or {}).encode()
     request = urllib.request.Request(f"{API}/{method}", data=encoded)
-    with urllib.request.urlopen(request, timeout=60) as response:
-        payload = json.loads(response.read().decode())
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode())
+    except HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = {}
+        description = payload.get("description") or body or str(exc)
+        raise TelegramAPIError(method, exc.code, description, payload) from exc
     if not payload.get("ok"):
-        raise RuntimeError(payload)
+        description = payload.get("description") or str(payload)
+        raise TelegramAPIError(method, int(payload.get("error_code", 0)), description, payload)
     return payload["result"]
+
+
+def telegram_error_matches(exc: Exception, *needles: str) -> bool:
+    if not isinstance(exc, TelegramAPIError):
+        return False
+    description = exc.description.lower()
+    return any(needle.lower() in description for needle in needles)
 
 
 def send_message(chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> None:
     data: dict[str, Any] = {"chat_id": chat_id, "text": text}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-    api("sendMessage", data)
+    try:
+        api("sendMessage", data)
+    except TelegramAPIError as exc:
+        if exc.code == 403 or telegram_error_matches(exc, "bot was blocked", "chat not found", "user is deactivated"):
+            print(f"Telegram sendMessage skipped: {exc}")
+            return
+        raise
 
 
 def answer_callback(callback_id: str, text: str = "") -> None:
-    api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+    try:
+        api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+    except TelegramAPIError as exc:
+        if telegram_error_matches(exc, "query is too old", "query id is invalid", "query_id_invalid"):
+            print(f"Telegram answerCallbackQuery skipped: {exc}")
+            return
+        raise
 
 
 def edit_message(chat_id: int, message_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> None:
     data: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-    api("editMessageText", data)
+    try:
+        api("editMessageText", data)
+    except TelegramAPIError as exc:
+        if telegram_error_matches(exc, "message is not modified"):
+            print(f"Telegram editMessageText unchanged: {exc}")
+            return
+        if telegram_error_matches(exc, "message to edit not found", "message can't be edited", "message identifier is not specified"):
+            print(f"Telegram editMessageText fallback to sendMessage: {exc}")
+            send_message(chat_id, text, reply_markup)
+            return
+        raise
 
 
 def inline(rows: list[list[tuple[str, str]]]) -> dict[str, Any]:
@@ -800,7 +848,7 @@ def main() -> None:
                 "getUpdates",
                 {"offset": offset, "timeout": POLL_TIMEOUT, "allowed_updates": json.dumps(["message", "callback_query"])},
             )
-        except HTTPError as exc:
+        except TelegramAPIError as exc:
             if exc.code == 409:
                 print("Telegram getUpdates conflict; waiting for the previous poll to finish.")
                 time_module.sleep(5)
@@ -814,7 +862,6 @@ def main() -> None:
             print(f"Telegram getUpdates network error: {exc}; retrying.")
             time_module.sleep(10)
             continue
-            raise
         for update in updates:
             offset = max(offset, update["update_id"] + 1)
             try:
@@ -826,10 +873,11 @@ def main() -> None:
                     else:
                         handle_callback(update["callback_query"])
             except Exception as exc:
+                traceback.print_exc()
                 target = update.get("message") or update.get("callback_query", {}).get("message")
                 if target:
                     try:
-                        send_message(target["chat"]["id"], f"Ошибка: {exc}")
+                        send_message(target["chat"]["id"], "Не получилось обработать действие. Попробуйте ещё раз.")
                     except Exception:
                         traceback.print_exc()
         if not updates:

@@ -193,5 +193,56 @@ class BotFlowTest(unittest.TestCase):
         self.assertEqual(self.edited[-1][2], "Напоминание не найдено.")
 
 
+class TelegramAPIWrapperTest(unittest.TestCase):
+    def telegram_error(self, method, description, code=400):
+        return bot.TelegramAPIError(method, code, description, {"ok": False, "description": description})
+
+    def test_edit_message_ignores_unchanged_message(self):
+        with patch.object(
+            bot,
+            "api",
+            side_effect=self.telegram_error("editMessageText", "Bad Request: message is not modified"),
+        ) as api:
+            bot.edit_message(1, 10, "Текст")
+
+        api.assert_called_once()
+
+    def test_edit_message_falls_back_to_send_message_when_edit_is_gone(self):
+        calls = []
+
+        def fake_api(method, data=None):
+            calls.append((method, data))
+            if method == "editMessageText":
+                raise self.telegram_error("editMessageText", "Bad Request: message to edit not found")
+            return {"message_id": 11}
+
+        with patch.object(bot, "api", side_effect=fake_api):
+            bot.edit_message(1, 10, "Новый текст")
+
+        self.assertEqual(calls[0][0], "editMessageText")
+        self.assertEqual(calls[1][0], "sendMessage")
+        self.assertEqual(calls[1][1]["text"], "Новый текст")
+
+    def test_answer_callback_ignores_stale_query(self):
+        with patch.object(
+            bot,
+            "api",
+            side_effect=self.telegram_error("answerCallbackQuery", "Bad Request: query is too old and response timeout expired"),
+        ) as api:
+            bot.answer_callback("old-callback")
+
+        api.assert_called_once()
+
+    def test_send_message_ignores_blocked_chat(self):
+        with patch.object(
+            bot,
+            "api",
+            side_effect=self.telegram_error("sendMessage", "Forbidden: bot was blocked by the user", 403),
+        ) as api:
+            bot.send_message(1, "Текст")
+
+        api.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
